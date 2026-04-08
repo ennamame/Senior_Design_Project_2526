@@ -1,24 +1,28 @@
+# Molecule Classification Module
+# BMES 493 - Team 9 
+# Anne Nguyen 
+# Last Updated: 2026-04-07
+
+# Import necessary libraries
 import pandas as pd
 import numpy as np
 from collections import defaultdict
 
 
-# ============================================================
-# Helper: determine which molecule end is the expected
-# telomeric end based on:
-# - chromosome arm
-# - contig orientation
-# - molecule orientation
-# ============================================================
 def expected_telomere_end(chrom_arm, contig_orientation, molecule_orientation):
     """
-    Returns either 'START' or 'END'.
+    Decide whether the telomere is expected at the molecule START or END based on chromosome arm, contig orientation, and molecule orientation
 
-    Rules:
-    - p arm, contig + : mol + -> START ; mol - -> END
-    - p arm, contig - : mol + -> END   ; mol - -> START
-    - q arm, contig + : mol + -> END   ; mol - -> START
-    - q arm, contig - : mol + -> START ; mol - -> END
+    INPUTS:
+        • chrom_arm (str): chromosome of interest's arm (Expected values: "p" or "q")
+        • contig_orientation (str): orientation of contig (Expected values: "+" or "-")
+        • molecule_orientation (str): orientation of molecule (Expected values: "+" or "-"; derived from "Ori" column in the data)
+            "+" means the molecule is oriented in the same direction as the contig
+            "-" means the molecule is oriented in the opposite direction as the contig 
+
+    RETURNS (str): "START" or "END"
+
+    RAISES: ValueError if the combination of inputs is invalid
     """
     if chrom_arm == "p" and contig_orientation == "+":
         return "START" if molecule_orientation == "+" else "END"
@@ -29,33 +33,56 @@ def expected_telomere_end(chrom_arm, contig_orientation, molecule_orientation):
     elif chrom_arm == "q" and contig_orientation == "-":
         return "START" if molecule_orientation == "+" else "END"
     else:
-        raise ValueError("Invalid combination of chromosome arm / contig orientation / molecule orientation")
+        raise ValueError(
+            "Invalid chromosome arm / contig orientation / molecule orientation combination.")
 
 
-# ============================================================
-# Helper: build molecule-level metadata
-# ============================================================
 def extract_molecule_info(df):
     """
-    For each unique molecule:
-    - start_qmap = 0
-    - end_qmap = Molecule Length
-      If Molecule Length is missing, fallback to Qmap_position where
-      LabelChannel == 0. If that also fails, use max Qmap_position.
+    Build molecule-level metadata used later for distance calculations
 
-    For row/site distance:
-    - start_site = 0
-    - end_site = siteID at LabelChannel == 0 if available,
-      otherwise max siteID
+    LOGICS:
+    • For each unique molecule, define the molecule START and END in both:
+        - Qmap position space
+        - siteID space
+    • Default logic for determining molecule START and END:
+        - molecule start qmap = 0
+        - molecule end qmap = Molecule Length
+        - if Molecule Length is missing, fallback to Qmap_position where
+          LabelChannel == 0
+        - if that is also missing, fallback to max Qmap_position
+    • For siteID:
+        - start site = 0
+        - end site = siteID where LabelChannel == 0
+        - if missing, fallback to max siteID
 
-    Also stores molecule orientation from Ori.
+    INPUTS:
+    • df (pd.DataFrame):
+        Data for one worksheet. Must contain at least:
+            - "Molecule ID"
+            - "LabelChannel"
+            - "Qmap_position"
+            - "siteID"
+            - "Ori"
+            Optional:
+            - "Molecule Length"
+
+    RETURNS:
+    • dict:
+        Dictionary keyed by Molecule ID, where each value is another dict with molecule metadata
+        Each value is another dict with:
+            - "start_qmap" (float)
+            - "end_qmap" (float)
+            - "start_site" (int)
+            - "end_site" (int)
+            - "ori" (str)
     """
     molecule_info = {}
 
     for molecule_id, sub_df in df.groupby("Molecule ID", sort=False):
         sub_df = sub_df.reset_index(drop=True)
 
-        # Determine molecule end in Qmap space
+        # Determine molecule END in qmap coordinates
         if "Molecule Length" in sub_df.columns and pd.notna(sub_df["Molecule Length"].iloc[0]):
             end_qmap = float(sub_df["Molecule Length"].iloc[0])
         else:
@@ -65,7 +92,7 @@ def extract_molecule_info(df):
             else:
                 end_qmap = float(sub_df["Qmap_position"].max())
 
-        # Determine molecule end in siteID space
+        # Determine molecule END in site coordinates
         zero_rows = sub_df[sub_df["LabelChannel"] == 0]
         if not zero_rows.empty:
             end_site = int(zero_rows["siteID"].max())
@@ -83,18 +110,39 @@ def extract_molecule_info(df):
     return molecule_info
 
 
-# ============================================================
-# Helper: get expected telomeric end positions
-# ============================================================
 def get_expected_end_positions(mol_info, chrom_arm, contig_orientation):
     """
-    Returns:
-    - expected end name ('START' or 'END')
-    - expected end qmap
-    - expected end site
+    Get the expected telomeric end and its coordinates for one molecule
+
+    LOGICS:
+    Combines molecule metadata with chromosome/contig information to determine:
+        - whether the expected telomeric end is START or END
+        - the qmap coordinate of that end
+        - the siteID of that end
+
+    INPUTS:
+    • mol_info (dict):
+        One molecule's metadata from extract_molecule_info()
+        Expected keys:
+            - "start_qmap"
+            - "end_qmap"
+            - "start_site"
+            - "end_site"
+            - "ori"
+    • chrom_arm (str):
+        "p" or "q"
+    • contig_orientation (str):
+        "+" or "-"
+
+    RETURNS:
+        tuple:
+            (
+                end_name (str),       # "START" or "END"
+                end_qmap (float),     # qmap coordinate of expected telomeric end
+                end_site (int)        # siteID coordinate of expected telomeric end
+            )
     """
-    molecule_orientation = mol_info["ori"]
-    end_name = expected_telomere_end(chrom_arm, contig_orientation, molecule_orientation)
+    end_name = expected_telomere_end(chrom_arm, contig_orientation, mol_info["ori"])
 
     if end_name == "START":
         return end_name, mol_info["start_qmap"], mol_info["start_site"]
@@ -102,22 +150,36 @@ def get_expected_end_positions(mol_info, chrom_arm, contig_orientation):
         return end_name, mol_info["end_qmap"], mol_info["end_site"]
 
 
-# ============================================================
-# Helper: choose telomere on expected side of anchor
-# ============================================================
 def choose_telomere_on_expected_side(sub_df, anchor_idx, expected_end_name, window=3):
     """
-    Only look for LabelChannel == 1 on the expected telomeric side
-    of the anchor row.
+    Select a direct telomere label near the anchor on the correct side only
 
-    If expected_end_name == 'END':
-      keep rows from anchor_idx to anchor_idx + window
+    LOGICS:
+    • Search for rows with LabelChannel == 1 near the anchor row, but only on the expected telomeric side of the anchor:
+        - if expected telomeric end is END, search from anchor toward END
+        - if expected telomeric end is START, search from anchor toward START
+    • Among valid candidate telomere rows, choose the one closest to the anchor row
 
-    If expected_end_name == 'START':
-      keep rows from anchor_idx - window to anchor_idx
+    INPUTS:
+    • sub_df (pd.DataFrame):
+        Data for a single molecule, already reset_index(drop=True)
+        Must contain:
+            - "LabelChannel"
+            - "Qmap_position"
+    • anchor_idx (int):
+        Row index of the target/anchor contig site (or fallback anchor site) within sub_df
+    • expected_end_name (str):
+        "START" or "END"
+    • window (int, optional):
+        - Number of rows to search on the valid side of the anchor
+        - Default = 3
 
-    Among valid telomere labels, choose the one closest to the anchor.
+    RETURNS:
+        pd.Series or None:
+            - Returns the selected telomere row if found
+            - Returns None if no valid telomere row exists in the search region
     """
+    # Restrict search to only the biologically valid side of the anchor
     if expected_end_name == "END":
         left = anchor_idx
         right = min(len(sub_df), anchor_idx + window + 1)
@@ -133,11 +195,10 @@ def choose_telomere_on_expected_side(sub_df, anchor_idx, expected_end_name, wind
     if tel_rows.empty:
         return None
 
-    # Closest to anchor by row index distance
-    tel_rows["row_offset_from_anchor"] = abs(tel_rows.index - anchor_idx)
-
-    # Tie-break by qmap distance to anchor
     anchor_qmap = float(sub_df.iloc[anchor_idx]["Qmap_position"])
+
+    # Choose the telomere closest to the anchor row first, then break ties using qmap distance to the anchor
+    tel_rows["row_offset_from_anchor"] = abs(tel_rows.index - anchor_idx)
     tel_rows["qmap_offset_from_anchor"] = abs(tel_rows["Qmap_position"] - anchor_qmap)
 
     best_tel = tel_rows.sort_values(
@@ -147,37 +208,66 @@ def choose_telomere_on_expected_side(sub_df, anchor_idx, expected_end_name, wind
     return best_tel
 
 
-# ============================================================
-# Helper: compute direction-consistent averages for fallback
-# ============================================================
 def finding_averages(df, molecule_info, contig_id, chrom_arm, contig_orientation, target_site, tel_window=3):
     """
-    Computes direction-consistent averages for fallback estimation.
+    Compute direction-aware averages used for fallback estimation
 
-    1) label_qmap_avg_by_end:
-       signed average offset from target site qmap to telomere qmap
-       separately for expected START vs END molecules
+    LOGICS:
+    • Keep the same general fallback idea as v1, but make it consistent with the updated v2 logic
+    • This function computes:
+        1) signed average target-site -> telomere offsets separately for START-ending and END-ending molecules
+        2) signed average nearby-site -> target-site offsets
+    • These averages are later used when:
+        - the exact target/anchor contig site is missing
+        - or a direct telomere label cannot be found
 
-    2) label_site_avg_by_end:
-       signed average offset from target site siteID to telomere siteID
-       separately for expected START vs END molecules
+    INPUTS:
+    • df (pd.DataFrame):
+        Worksheet data. Must contain:
+            - "Molecule ID"
+            - "Contig_ID"
+            - "Contig_Site"
+            - "Qmap_position"
+            - "siteID"
+            - "LabelChannel"
+    • molecule_info (dict):
+        Output from extract_molecule_info()
+    • contig_id (int):
+        Contig ID selected by the user
+    • chrom_arm (str):
+            "p" or "q"
+    • contig_orientation (str):
+            "+" or "-"
+    • target_site (int):
+            Target/anchor contig site selected by the user
+    • tel_window (int, optional):
+        - Search window for direct telomere lookup around the target site
+        - Default = 3
 
-    3) gap_qmap_avg:
-       signed average offset from nearby site qmap to target site qmap
-       keyed by nearby site number
-
-    4) gap_site_avg:
-       signed average offset from nearby site siteID to target site siteID
-       keyed by nearby site number
-
-    These preserve the v1 skeleton but make it direction-aware and
-    consistent with the updated side-restricted telomere selection.
+    RETURNS:
+    tuple:
+            (
+                label_qmap_avg_by_end (dict),
+                label_site_avg_by_end (dict),
+                gap_qmap_avg (dict),
+                gap_site_avg (dict)
+            )
+        • label_qmap_avg_by_end:
+            {"START": float, "END": float}
+        • label_site_avg_by_end:
+            {"START": float, "END": float}
+        • gap_qmap_avg:
+            {nearby_site: float}
+        • gap_site_avg:
+            {nearby_site: float}
     """
     df_contig = df[df["Contig_ID"] == contig_id].copy()
 
+    # Offsets from target site to direct telomere
     label_qmap_offsets = {"START": [], "END": []}
     label_site_offsets = {"START": [], "END": []}
 
+    # Offsets from nearby site to target site
     gap_qmap_offsets = defaultdict(list)
     gap_site_offsets = defaultdict(list)
 
@@ -195,7 +285,7 @@ def finding_averages(df, molecule_info, contig_id, chrom_arm, contig_orientation
         mol_info = molecule_info[molecule_id]
         end_name, _, _ = get_expected_end_positions(mol_info, chrom_arm, contig_orientation)
 
-        # Find direct telomere using the same side-aware logic as classification
+        # Find direct telomere using the same side-aware rule used in classification
         best_tel = choose_telomere_on_expected_side(
             sub_df=sub_df,
             anchor_idx=idx,
@@ -207,11 +297,11 @@ def finding_averages(df, molecule_info, contig_id, chrom_arm, contig_orientation
             tel_qmap = float(best_tel["Qmap_position"])
             tel_siteid = int(best_tel["siteID"])
 
-            # signed target -> tel offsets
+            # Signed offsets preserve direction
             label_qmap_offsets[end_name].append(tel_qmap - target_qmap)
             label_site_offsets[end_name].append(tel_siteid - target_siteid)
 
-        # Compute signed nearby-site -> target-site offsets
+        # Look for nearby sites within +/- 5 around target site
         for other_site in range(target_site - 5, target_site + 6):
             if other_site == target_site:
                 continue
@@ -222,22 +312,19 @@ def finding_averages(df, molecule_info, contig_id, chrom_arm, contig_orientation
                 other_qmap = float(sub_df.iloc[other_idx]["Qmap_position"])
                 other_siteid = int(sub_df.iloc[other_idx]["siteID"])
 
-                # signed offset from nearby site to target site
+                # Signed offset from nearby site to target site
                 gap_qmap_offsets[other_site].append(target_qmap - other_qmap)
                 gap_site_offsets[other_site].append(target_siteid - other_siteid)
 
-    label_qmap_avg_by_end = {}
-    label_site_avg_by_end = {}
+    label_qmap_avg_by_end = {
+        end_name: float(np.mean(values)) if values else 0.0
+        for end_name, values in label_qmap_offsets.items()
+    }
 
-    for end_name in ["START", "END"]:
-        label_qmap_avg_by_end[end_name] = (
-            float(np.mean(label_qmap_offsets[end_name]))
-            if label_qmap_offsets[end_name] else 0.0
-        )
-        label_site_avg_by_end[end_name] = (
-            float(np.mean(label_site_offsets[end_name]))
-            if label_site_offsets[end_name] else 0.0
-        )
+    label_site_avg_by_end = {
+        end_name: float(np.mean(values)) if values else 0.0
+        for end_name, values in label_site_offsets.items()
+    }
 
     gap_qmap_avg = {
         site: float(np.mean(values))
@@ -254,9 +341,6 @@ def finding_averages(df, molecule_info, contig_id, chrom_arm, contig_orientation
     return label_qmap_avg_by_end, label_site_avg_by_end, gap_qmap_avg, gap_site_avg
 
 
-# ============================================================
-# Main classification logic
-# ============================================================
 def classify_molecules(
     df,
     molecule_info,
@@ -272,21 +356,70 @@ def classify_molecules(
     fusion_threshold=10000
 ):
     """
-    Classifies molecules into:
-    - Normal_Telomere
-    - Fused_Telomere
-    - Normal_No_Telomere
-    - Fused_No_Telomere
+    Classify molecules into the 4 output categories
 
-    Updated direct-label logic:
-    - determine expected telomeric molecule end
-    - only search for LabelChannel == 1 on that expected side of anchor
-    - among those valid-side telomere labels, choose the one closest to anchor
+    LOGICS:
+    For each molecule in the selected Contig_ID:
+        1) try to find the exact target/anchor contig site
+        2) if missing, fallback to the nearest site within +/- 5
+        3) determine which molecule end is expected to be telomeric
+        4) search for a direct telomere label only on that valid side
+        5) if found, use direct distance
+        6) if not found, estimate telomere location using fallback averages
 
-    Updated estimation logic:
-    - keep v1-style skeleton
-    - use signed, direction-aware target->tel averages
-    - use signed nearby-site->target-site gap averages
+    INPUTS:
+    • df (pd.DataFrame):
+        Worksheet data
+    • molecule_info (dict):
+        Output from extract_molecule_info()
+    • contig_id (int):
+        Selected Contig_ID
+    • chrom_arm (str):
+        "p" or "q"
+    • contig_orientation (str):
+        "+" or "-"
+    • target_site (int):
+        Selected target/anchor contig site
+    • label_qmap_avg_by_end (dict):
+        Output from finding_averages()
+    • label_site_avg_by_end (dict):
+        Output from finding_averages()
+    • gap_qmap_avg (dict):
+        Output from finding_averages()
+    • gap_site_avg (dict):
+        Output from finding_averages()
+    • tel_window (int, optional):
+        - Direct telomere search window
+        - Default = 3
+    • fusion_threshold (int or float, optional):
+        - Threshold in bp for fused vs normal
+        - Default = 10000
+
+    RETURNS:
+        tuple:
+            (
+                categories (dict),
+                result_df (pd.DataFrame),
+                total_unique_molecules (int)
+            )
+
+            • categories:
+                Dictionary with keys:
+                - "Normal_Telomere"
+                - "Fused_Telomere"
+                - "Normal_No_Telomere"
+                - "Fused_No_Telomere"
+
+            • result_df:
+                Per-molecule summary with columns:
+                - "Molecule_ID"
+                - "Distance_bp"
+                - "Number_of_Sites"
+                - "Category"
+                - "Telomere_Method"
+
+            • total_unique_molecules:
+                Number of unique molecules in the selected Contig_ID subset.
     """
     categories = {
         "Normal_Telomere": [],
@@ -297,6 +430,7 @@ def classify_molecules(
 
     result_rows = []
 
+    # Restrict analysis to the selected Contig_ID
     df_contig = df[df["Contig_ID"] == contig_id].copy()
     total_unique_molecules = df_contig["Molecule ID"].nunique()
 
@@ -308,9 +442,7 @@ def classify_molecules(
             mol_info, chrom_arm, contig_orientation
         )
 
-        # ----------------------------------------------------
-        # Step 1: find exact target site
-        # ----------------------------------------------------
+        # Step 1: try exact target site
         target_hits = sub_df.index[sub_df["Contig_Site"] == target_site].tolist()
 
         anchor_idx = None
@@ -320,9 +452,7 @@ def classify_molecules(
         if target_hits:
             anchor_idx = target_hits[0]
         else:
-            # ------------------------------------------------
-            # Step 2: fallback to nearest site within +/- 5
-            # ------------------------------------------------
+            # Step 2: fallback to nearest available site within +/- 5
             fallback_order = [
                 target_site - 1, target_site + 1,
                 target_site - 2, target_site + 2,
@@ -339,6 +469,7 @@ def classify_molecules(
                     used_fallback = True
                     break
 
+        # If no exact or fallback anchor can be found, record as unclassified
         if anchor_idx is None:
             result_rows.append({
                 "Molecule_ID": molecule_id,
@@ -352,9 +483,7 @@ def classify_molecules(
         anchor_qmap = float(sub_df.iloc[anchor_idx]["Qmap_position"])
         anchor_siteid = int(sub_df.iloc[anchor_idx]["siteID"])
 
-        # ----------------------------------------------------
-        # Step 3: direct telomere selection using updated rule
-        # ----------------------------------------------------
+        # Step 3: look for direct telomere on the expected side only
         best_tel = choose_telomere_on_expected_side(
             sub_df=sub_df,
             anchor_idx=anchor_idx,
@@ -363,6 +492,7 @@ def classify_molecules(
         )
 
         if best_tel is not None:
+            # Direct telomere-based classification
             tel_qmap = float(best_tel["Qmap_position"])
             tel_siteid = int(best_tel["siteID"])
 
@@ -377,11 +507,8 @@ def classify_molecules(
             tel_method = "direct_telomere"
 
         else:
-            # ------------------------------------------------
-            # Step 4: estimate telomere position/site
-            # keeping v1-style skeleton but making it signed
-            # and direction-consistent
-            # ------------------------------------------------
+            # Fallback estimation logic:
+            # estimate where the target site would be, then estimate the telomere
             if used_fallback:
                 estimated_target_qmap = anchor_qmap + gap_qmap_avg.get(used_site, 0.0)
                 estimated_target_siteid = anchor_siteid + gap_site_avg.get(used_site, 0.0)
@@ -416,12 +543,28 @@ def classify_molecules(
     return categories, result_df, total_unique_molecules
 
 
-# ============================================================
-# Write human-readable summary TXT
-# ============================================================
 def write_summary_txt(categories, dataset_label, contig_id, target_site, total_molecules):
     """
-    Writes overall classification summary to TXT.
+    Write overall classification summary to a TXT file.
+
+    Purpose:
+        Save the category counts and percentages in a simple human-readable format.
+
+    Inputs:
+        categories (dict):
+            Output category dictionary from classify_molecules().
+        dataset_label (str):
+            Usually worksheet name, e.g. "2q-".
+        contig_id (int):
+            Selected Contig_ID.
+        target_site (int):
+            Selected target/anchor contig site.
+        total_molecules (int):
+            Total number of unique molecules analyzed.
+
+    Returns:
+        str:
+            Output TXT filename.
     """
     output_txt = f"classification_summary_{dataset_label}_contig{contig_id}_site{target_site}.txt"
 
@@ -441,13 +584,26 @@ def write_summary_txt(categories, dataset_label, contig_id, target_site, total_m
     return output_txt
 
 
-# ============================================================
-# Write per-molecule CSV for downstream module
-# ============================================================
 def write_per_molecule_csv(result_df, dataset_label, contig_id, target_site):
     """
-    Writes per-molecule structured CSV.
-    Only includes columns needed for downstream module.
+    Write per-molecule summary to CSV for downstream analysis.
+
+    Purpose:
+        Save structured molecule-level output for use in later Python modules.
+
+    Inputs:
+        result_df (pd.DataFrame):
+            Output dataframe from classify_molecules().
+        dataset_label (str):
+            Usually worksheet name, e.g. "2q-".
+        contig_id (int):
+            Selected Contig_ID.
+        target_site (int):
+            Selected target/anchor contig site.
+
+    Returns:
+        str:
+            Output CSV filename.
     """
     output_csv = f"per_molecule_summary_{dataset_label}_contig{contig_id}_site{target_site}.csv"
 
@@ -463,10 +619,19 @@ def write_per_molecule_csv(result_df, dataset_label, contig_id, target_site):
     return output_csv
 
 
-# ============================================================
-# Pretty-print summary table in terminal
-# ============================================================
 def print_summary_table(categories, total_molecules):
+    """
+    Print classification summary in a tab-delimited table.
+
+    Inputs:
+        categories (dict):
+            Output category dictionary from classify_molecules().
+        total_molecules (int):
+            Total number of unique molecules analyzed.
+
+    Returns:
+        None
+    """
     print("Category\tCount\tPercentage")
     for category in ["Normal_Telomere", "Fused_Telomere", "Normal_No_Telomere", "Fused_No_Telomere"]:
         count = len(categories[category])
@@ -474,10 +639,20 @@ def print_summary_table(categories, total_molecules):
         print(f"{category}\t{count}\t{percentage:.2f}%")
 
 
-# ============================================================
-# Print per-molecule summary in terminal
-# ============================================================
 def print_per_molecule_terminal(result_df):
+    """
+    Print per-molecule summary lines to the terminal.
+
+    Format:
+        MoleculeID_(distance_bp,number_of_sites)
+
+    Inputs:
+        result_df (pd.DataFrame):
+            Output dataframe from classify_molecules().
+
+    Returns:
+        None
+    """
     if result_df.empty:
         print("No molecules were processed.")
         return
@@ -489,11 +664,31 @@ def print_per_molecule_terminal(result_df):
             print(f"{row['Molecule_ID']}_({row['Distance_bp']},{row['Number_of_Sites']})")
 
 
-# ============================================================
-# Main
-# ============================================================
 def main():
-    # Terminal inputs
+    """
+    Main entry point for running the molecule classification module.
+
+    Purpose:
+        1) collect terminal inputs
+        2) load the correct Excel worksheet
+        3) build molecule metadata
+        4) compute fallback averages
+        5) classify molecules
+        6) print terminal output
+        7) write summary TXT and per-molecule CSV
+
+    Inputs from terminal:
+        Path to Data (.xlsx)
+        Chromosome Number
+        Chromosome Arm
+        Contig Orientation
+        Contig ID
+        Target Contig Site
+
+    Returns:
+        None
+    """
+    # Collect run settings from the user
     path = input("Path to Data (.xlsx): ").strip()
     chrom_num = input("Chromosome Number (e.g., 2): ").strip()
     chrom_arm = input("Chromosome Arm (p or q): ").strip()
@@ -501,14 +696,15 @@ def main():
     contig_id = int(input("Contig ID (integer): ").strip())
     target_site = int(input("Target Contig Site (integer): ").strip())
 
-    # Build sheet name from chromosome number + arm + contig orientation
+    # Worksheet names follow the pattern: chromosome number + arm + orientation
+    # Example: 2q-
     sheet_name = f"{chrom_num}{chrom_arm}{contig_orientation}"
     dataset_label = sheet_name
 
-    # Load Excel sheet
+    # Load selected worksheet from Excel workbook
     df = pd.read_excel(path, sheet_name=sheet_name)
 
-    # Check required columns
+    # Basic input validation for required columns
     required_cols = [
         "Molecule ID",
         "Qmap_position",
@@ -522,10 +718,10 @@ def main():
     if missing_cols:
         raise ValueError(f"Missing required columns in sheet '{sheet_name}': {missing_cols}")
 
-    # Build molecule-level metadata
+    # Build reusable metadata for each molecule
     molecule_info = extract_molecule_info(df)
 
-    # Compute direction-consistent averages for fallback estimation
+    # Compute averages used by fallback estimation logic
     label_qmap_avg_by_end, label_site_avg_by_end, gap_qmap_avg, gap_site_avg = finding_averages(
         df=df,
         molecule_info=molecule_info,
@@ -536,7 +732,7 @@ def main():
         tel_window=3
     )
 
-    # Run classification
+    # Run the main classification step
     categories, result_df, total_molecules = classify_molecules(
         df=df,
         molecule_info=molecule_info,
@@ -552,7 +748,7 @@ def main():
         fusion_threshold=10000
     )
 
-    # Terminal output
+    # Print run context
     print("\n==================================================")
     print(f"Dataset: {dataset_label}")
     print(f"Contig ID: {contig_id}")
@@ -560,15 +756,17 @@ def main():
     print(f"Total Molecules: {total_molecules}")
     print("==================================================")
 
+    # Print classification summary
     print("\nClassification Summary")
     print_summary_table(categories, total_molecules)
 
+    # Print per-molecule summary lines
     print("\n--------------------------------------------------")
     print("Per-Molecule Summary")
     print_per_molecule_terminal(result_df)
     print("--------------------------------------------------")
 
-    # Write files
+    # Save outputs to files
     summary_txt = write_summary_txt(
         categories=categories,
         dataset_label=dataset_label,

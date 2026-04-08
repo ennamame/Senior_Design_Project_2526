@@ -1,0 +1,10 @@
+Dataset: 13q+
+Contig ID: 1070
+Target Contig Site: 284
+Total Molecules: 42
+
+Category	Count	Percentage
+Normal_Telomere	23	54.76%
+Fused_Telomere	8	19.05%
+Normal_No_Telomere	9	21.43%
+Fused_No_Telomere	2	4.76%
